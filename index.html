@@ -44,7 +44,7 @@
       }
 
       .app {
-        width: min(720px, 100%);
+        width: min(760px, 100%);
         margin: 0 auto;
         padding: 28px 18px 36px;
       }
@@ -64,23 +64,74 @@
         letter-spacing: 0;
       }
 
-      .count {
-        min-width: 92px;
-        padding: 8px 12px;
+      .count,
+      .sync-status {
         border: 1px solid var(--line);
         border-radius: 8px;
         background: rgba(255, 255, 255, 0.72);
         color: var(--muted);
-        text-align: center;
         white-space: nowrap;
       }
 
+      .count {
+        min-width: 92px;
+        padding: 8px 12px;
+        text-align: center;
+      }
+
+      .sync-status {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        min-height: 34px;
+        padding: 6px 10px;
+        font-size: 14px;
+      }
+
+      .sync-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 999px;
+        background: var(--muted);
+      }
+
+      .sync-status.online .sync-dot {
+        background: var(--accent);
+      }
+
+      .sync-status.error .sync-dot {
+        background: var(--warn);
+      }
+
       .composer,
+      .settings,
       .list-shell {
         background: var(--panel);
         border: 1px solid var(--line);
         border-radius: 8px;
         box-shadow: var(--shadow);
+      }
+
+      .settings {
+        display: grid;
+        gap: 10px;
+        padding: 12px;
+        margin-bottom: 14px;
+      }
+
+      .settings[open] summary {
+        margin-bottom: 2px;
+      }
+
+      summary {
+        cursor: pointer;
+        font-weight: 700;
+      }
+
+      .settings-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr auto auto;
+        gap: 10px;
       }
 
       .composer {
@@ -133,9 +184,22 @@
         transform: translateY(1px);
       }
 
+      button:disabled {
+        cursor: not-allowed;
+        filter: grayscale(0.2);
+        opacity: 0.55;
+      }
+
       .add-button {
         width: 74px;
         font-weight: 700;
+      }
+
+      .secondary-button {
+        min-width: 92px;
+        border: 1px solid var(--line);
+        background: #fff;
+        color: var(--text);
       }
 
       .list-shell {
@@ -251,6 +315,12 @@
         border: 0;
       }
 
+      @media (max-width: 680px) {
+        .settings-grid {
+          grid-template-columns: 1fr;
+        }
+      }
+
       @media (max-width: 560px) {
         .app {
           padding: 22px 12px 28px;
@@ -311,6 +381,20 @@
         <div class="count" id="taskCount">0件</div>
       </header>
 
+      <details class="settings" id="settings">
+        <summary>Supabase</summary>
+        <form class="settings-grid" id="settingsForm">
+          <label class="sr-only" for="supabaseUrl">Supabase URL</label>
+          <input id="supabaseUrl" name="supabaseUrl" placeholder="Supabase URL" autocomplete="off" />
+
+          <label class="sr-only" for="supabaseKey">Supabase anon key</label>
+          <input id="supabaseKey" name="supabaseKey" placeholder="anon key" autocomplete="off" />
+
+          <button type="submit">保存</button>
+          <button class="secondary-button" id="disconnectButton" type="button">解除</button>
+        </form>
+      </details>
+
       <form class="composer" id="todoForm">
         <label class="sr-only" for="taskName">タスク名</label>
         <input id="taskName" name="taskName" autocomplete="off" placeholder="タスク名" required />
@@ -333,6 +417,10 @@
             <button class="filter" type="button" data-filter="doing" aria-pressed="false">着手中</button>
             <button class="filter" type="button" data-filter="done" aria-pressed="false">完了</button>
           </div>
+          <div class="sync-status" id="syncStatus" aria-live="polite">
+            <span class="sync-dot"></span>
+            <span id="syncText">ローカル保存</span>
+          </div>
           <div class="hint" id="visibleCount">表示 0件</div>
         </div>
         <div class="tasks" id="tasks"></div>
@@ -353,8 +441,11 @@
       </article>
     </template>
 
-    <script>
+    <script type="module">
+      import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
       const storageKey = "personal-todo-items";
+      const configKey = "personal-todo-supabase";
       const form = document.querySelector("#todoForm");
       const taskName = document.querySelector("#taskName");
       const initialStatus = document.querySelector("#initialStatus");
@@ -363,17 +454,21 @@
       const taskCount = document.querySelector("#taskCount");
       const visibleCount = document.querySelector("#visibleCount");
       const filters = [...document.querySelectorAll(".filter")];
+      const settings = document.querySelector("#settings");
+      const settingsForm = document.querySelector("#settingsForm");
+      const supabaseUrl = document.querySelector("#supabaseUrl");
+      const supabaseKey = document.querySelector("#supabaseKey");
+      const disconnectButton = document.querySelector("#disconnectButton");
+      const syncStatus = document.querySelector("#syncStatus");
+      const syncText = document.querySelector("#syncText");
 
-      const statusLabel = {
-        todo: "未着手",
-        doing: "着手中",
-        done: "完了",
-      };
-
-      let tasks = loadTasks();
+      let tasks = loadLocalTasks();
       let filter = "all";
+      let db = null;
+      let currentUser = null;
+      let isRemoteReady = false;
 
-      function loadTasks() {
+      function loadLocalTasks() {
         try {
           return JSON.parse(localStorage.getItem(storageKey)) ?? [];
         } catch {
@@ -381,8 +476,123 @@
         }
       }
 
-      function saveTasks() {
+      function saveLocalTasks() {
         localStorage.setItem(storageKey, JSON.stringify(tasks));
+      }
+
+      function loadConfig() {
+        try {
+          return JSON.parse(localStorage.getItem(configKey)) ?? null;
+        } catch {
+          return null;
+        }
+      }
+
+      function saveConfig(config) {
+        localStorage.setItem(configKey, JSON.stringify(config));
+      }
+
+      function setSyncState(state, message) {
+        syncStatus.classList.toggle("online", state === "online");
+        syncStatus.classList.toggle("error", state === "error");
+        syncText.textContent = message;
+      }
+
+      function normalizeTask(row) {
+        return {
+          id: row.id,
+          name: row.name,
+          status: row.status,
+          createdAt: new Date(row.created_at ?? Date.now()).getTime(),
+        };
+      }
+
+      async function initializeSupabase() {
+        const config = loadConfig();
+        if (!config?.url || !config?.key) {
+          settings.open = true;
+          setSyncState("local", "ローカル保存");
+          render();
+          return;
+        }
+
+        supabaseUrl.value = config.url;
+        supabaseKey.value = config.key;
+        setSyncState("local", "接続中");
+
+        try {
+          db = createClient(config.url, config.key);
+          const { data: sessionData, error: sessionError } = await db.auth.getSession();
+          if (sessionError) throw sessionError;
+
+          let session = sessionData.session;
+          if (!session) {
+            const { data, error } = await db.auth.signInAnonymously();
+            if (error) throw error;
+            session = data.session;
+          }
+
+          currentUser = session?.user ?? null;
+          if (!currentUser) throw new Error("Supabase user was not created.");
+
+          await loadRemoteTasks();
+          isRemoteReady = true;
+          setSyncState("online", "Supabase保存");
+          settings.open = false;
+        } catch (error) {
+          console.error(error);
+          db = null;
+          currentUser = null;
+          isRemoteReady = false;
+          setSyncState("error", "ローカル保存");
+          render();
+        }
+      }
+
+      async function loadRemoteTasks() {
+        const { data, error } = await db
+          .from("tasks")
+          .select("id,name,status,created_at")
+          .order("created_at", { ascending: false });
+
+        if (error) throw error;
+
+        tasks = data.map(normalizeTask);
+        saveLocalTasks();
+        render();
+      }
+
+      async function insertRemoteTask(task) {
+        const { data, error } = await db
+          .from("tasks")
+          .insert({
+            id: task.id,
+            user_id: currentUser.id,
+            name: task.name,
+            status: task.status,
+          })
+          .select("id,name,status,created_at")
+          .single();
+
+        if (error) throw error;
+        return normalizeTask(data);
+      }
+
+      async function updateRemoteTask(id, patch) {
+        const { data, error } = await db
+          .from("tasks")
+          .update(patch)
+          .eq("id", id)
+          .select("id,name,status,created_at")
+          .single();
+
+        if (error) throw error;
+        return normalizeTask(data);
+      }
+
+      async function deleteRemoteTask(id) {
+        const { error } = await db.from("tasks").delete().eq("id", id);
+        if (error) throw error;
       }
 
       function render() {
@@ -425,38 +635,110 @@
           });
 
           remove.addEventListener("click", () => {
-            tasks = tasks.filter((item) => item.id !== task.id);
-            saveTasks();
-            render();
+            removeTask(task.id);
           });
 
           tasksEl.append(node);
         }
       }
 
-      function updateTask(id, patch) {
-        tasks = tasks.map((task) => (task.id === id ? { ...task, ...patch } : task));
-        saveTasks();
+      async function addTask(name, status) {
+        let task = {
+          id: crypto.randomUUID(),
+          name,
+          status,
+          createdAt: Date.now(),
+        };
+
+        tasks = [task, ...tasks];
+        saveLocalTasks();
         render();
+
+        if (isRemoteReady) {
+          try {
+            task = await insertRemoteTask(task);
+            tasks = tasks.map((item) => (item.id === task.id ? task : item));
+            saveLocalTasks();
+            render();
+          } catch (error) {
+            console.error(error);
+            setSyncState("error", "未同期");
+          }
+        }
       }
 
-      form.addEventListener("submit", (event) => {
+      async function updateTask(id, patch) {
+        const before = tasks;
+        tasks = tasks.map((task) => (task.id === id ? { ...task, ...patch } : task));
+        saveLocalTasks();
+        render();
+
+        if (isRemoteReady) {
+          try {
+            const updated = await updateRemoteTask(id, patch);
+            tasks = tasks.map((task) => (task.id === id ? updated : task));
+            saveLocalTasks();
+            render();
+          } catch (error) {
+            console.error(error);
+            tasks = before;
+            saveLocalTasks();
+            setSyncState("error", "未同期");
+            render();
+          }
+        }
+      }
+
+      async function removeTask(id) {
+        const before = tasks;
+        tasks = tasks.filter((item) => item.id !== id);
+        saveLocalTasks();
+        render();
+
+        if (isRemoteReady) {
+          try {
+            await deleteRemoteTask(id);
+          } catch (error) {
+            console.error(error);
+            tasks = before;
+            saveLocalTasks();
+            setSyncState("error", "未同期");
+            render();
+          }
+        }
+      }
+
+      form.addEventListener("submit", async (event) => {
         event.preventDefault();
         const name = taskName.value.trim();
         if (!name) return;
 
-        tasks = [
-          {
-            id: crypto.randomUUID(),
-            name,
-            status: initialStatus.value,
-            createdAt: Date.now(),
-          },
-          ...tasks,
-        ];
-        saveTasks();
+        await addTask(name, initialStatus.value);
         form.reset();
         taskName.focus();
+      });
+
+      settingsForm.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const url = supabaseUrl.value.trim();
+        const key = supabaseKey.value.trim();
+        if (!url || !key) return;
+
+        saveConfig({ url, key });
+        await initializeSupabase();
+      });
+
+      disconnectButton.addEventListener("click", async () => {
+        localStorage.removeItem(configKey);
+        if (db) await db.auth.signOut();
+        db = null;
+        currentUser = null;
+        isRemoteReady = false;
+        supabaseUrl.value = "";
+        supabaseKey.value = "";
+        settings.open = true;
+        tasks = loadLocalTasks();
+        setSyncState("local", "ローカル保存");
         render();
       });
 
@@ -469,6 +751,7 @@
       });
 
       render();
+      initializeSupabase();
     </script>
   </body>
 </html>
